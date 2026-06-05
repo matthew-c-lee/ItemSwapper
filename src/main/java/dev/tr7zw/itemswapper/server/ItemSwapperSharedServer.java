@@ -28,6 +28,8 @@ public abstract class ItemSwapperSharedServer {
                     (payload, player) -> getItemHandler().swapItem(player, payload));
             handler.registerServerCustomPacket(RefillItemPayload.INSTANCE,
                     (payload, player) -> getItemHandler().refillSlot(player, payload));
+            handler.registerServerCustomPacket(StonecutterSwapPayload.INSTANCE,
+                    (payload, player) -> getItemHandler().stonecutterSwap(player, payload));
         });
     }
 

@@ -11,6 +11,7 @@ import dev.tr7zw.itemswapper.provider.InstrumentItemNameProvider;
 import dev.tr7zw.itemswapper.provider.PotionNameProvider;
 import dev.tr7zw.itemswapper.provider.RecordNameProvider;
 import dev.tr7zw.itemswapper.provider.ShulkerContainerProvider;
+import dev.tr7zw.itemswapper.provider.StonecutterItemProvider;
 import lombok.Getter;
 import net.minecraft.world.item.Item;
 
@@ -45,6 +46,7 @@ public abstract class ItemSwapperSharedMod extends ItemSwapperBase {
 
     private void lateInit() {
         clientProviderManager.registerContainerProvider(new ShulkerContainerProvider());
+        clientProviderManager.registerLateItemProvider(new StonecutterItemProvider());
         clientProviderManager.registerNameProvider(new PotionNameProvider());
         clientProviderManager.registerNameProvider(new InstrumentItemNameProvider());
         clientProviderManager.registerNameProvider(new RecordNameProvider());

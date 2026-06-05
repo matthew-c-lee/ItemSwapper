@@ -12,6 +12,8 @@ import dev.tr7zw.transition.mc.InventoryUtil;
 import net.minecraft.core.NonNullList;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import dev.tr7zw.itemswapper.packets.serverbound.StonecutterSwapPayload;
+import net.minecraft.world.item.Item;
 
 public class ServerItemHandler {
 
@@ -83,6 +85,169 @@ public class ServerItemHandler {
         } catch (Throwable th) {
             network_logger.error("Error handeling network packet!", th);
         }
+    }
+
+    public void stonecutterSwap(ServerPlayer player, StonecutterSwapPayload payload) {
+        try {
+            Item targetItem = Item.byId(payload.targetItemId());
+            ItemStack selected = InventoryUtil.getSelected(player.getInventory());
+
+            if (selected == null || selected.isEmpty()) {
+                return;
+            }
+
+            var recipes = player.level().recipeAccess().stonecutterRecipes();
+
+            for (var entry : recipes.entries()) {
+                if (!entry.input().test(selected)) {
+                    continue;
+                }
+
+                var display = entry.recipe().optionDisplay();
+
+                ItemStack recipeResult = display.resolveForFirstStack(
+                        new net.minecraft.util.context.ContextMap.Builder()
+                                .create(new net.minecraft.util.context.ContextKeySet.Builder().build())
+                );
+
+                if (recipeResult.isEmpty() || recipeResult.getItem() != targetItem) {
+                    continue;
+                }
+
+                int outputPerCraft = recipeResult.getCount();
+                if (outputPerCraft <= 0) {
+                    continue;
+                }
+
+                int maxOutputStackSize = recipeResult.getMaxStackSize();
+                int crafts = Math.min(selected.getCount(), maxOutputStackSize / outputPerCraft);
+
+                if (crafts <= 0) {
+                    return;
+                }
+
+                int outputProduced = crafts * outputPerCraft;
+                int inputLeftover = selected.getCount() - crafts;
+
+                ItemStack outputStack = recipeResult.copy();
+                outputStack.setCount(outputProduced);
+
+                ItemStack leftoverInput = ItemStack.EMPTY;
+                if (inputLeftover > 0) {
+                    leftoverInput = selected.copy();
+                    leftoverInput.setCount(inputLeftover);
+                }
+
+                int selectedSlot = InventoryUtil.getSelectedId(player.getInventory());
+
+                if (inputLeftover > 0 && !hasSpaceFor(player, leftoverInput, selectedSlot)) {
+                    System.out.println("SERVER: stonecutter swap blocked, no room for leftover " + leftoverInput);
+                    return;
+                }
+
+                player.getInventory().setItem(selectedSlot, outputStack);
+
+                if (inputLeftover > 0) {
+                    boolean inserted = insertIntoInventoryExceptSelected(player, leftoverInput, selectedSlot);
+                    if (!inserted) {
+                        // This should not happen because we checked before mutating.
+                        // Do not drop items. Revert to safe state.
+                        player.getInventory().setItem(selectedSlot, selected);
+                        return;
+                    }
+                }
+
+                player.inventoryMenu.broadcastChanges();
+
+                System.out.println("SERVER: stonecutter swap executed: "
+                        + selected + " -> " + outputStack
+                        + ", leftover=" + leftoverInput);
+
+                return;
+            }
+
+            System.out.println("SERVER: no matching stonecutter recipe for target " + targetItem + " from " + selected);
+        } catch (Throwable th) {
+            network_logger.error("Error handling stonecutter swap packet!", th);
+        }
+    }
+
+    private boolean hasSpaceFor(ServerPlayer player, ItemStack stack, int selectedSlot) {
+        if (stack == null || stack.isEmpty()) {
+            return true;
+        }
+
+        ItemStack testStack = stack.copy();
+        return insertIntoInventoryExceptSelected(player, testStack, selectedSlot, true);
+    }
+
+    private boolean insertIntoInventoryExceptSelected(ServerPlayer player, ItemStack stack, int selectedSlot) {
+        return insertIntoInventoryExceptSelected(player, stack, selectedSlot, false);
+    }
+
+    private boolean insertIntoInventoryExceptSelected(ServerPlayer player, ItemStack stack, int selectedSlot,
+                                                      boolean simulate) {
+        if (stack == null || stack.isEmpty()) {
+            return true;
+        }
+
+        var items = InventoryUtil.getNonEquipmentItems(player.getInventory());
+
+        // First merge into existing compatible stacks.
+        for (int i = 0; i < items.size(); i++) {
+            if (i == selectedSlot) {
+                continue;
+            }
+
+            ItemStack existing = items.get(i);
+
+            if (existing.isEmpty()) {
+                continue;
+            }
+
+            if (!ItemStack.isSameItemSameComponents(existing, stack)) {
+                continue;
+            }
+
+            int space = existing.getMaxStackSize() - existing.getCount();
+            if (space <= 0) {
+                continue;
+            }
+
+            int moved = Math.min(space, stack.getCount());
+
+            if (!simulate) {
+                existing.grow(moved);
+            }
+
+            stack.shrink(moved);
+
+            if (stack.isEmpty()) {
+                return true;
+            }
+        }
+
+        // Then place into empty non-equipment slots only.
+        for (int i = 0; i < items.size(); i++) {
+            if (i == selectedSlot) {
+                continue;
+            }
+
+            ItemStack existing = items.get(i);
+
+            if (!existing.isEmpty()) {
+                continue;
+            }
+
+            if (!simulate) {
+                player.getInventory().setItem(i, stack.copy());
+            }
+
+            stack.setCount(0);
+            return true;
+        }
+
+        return stack.isEmpty();
     }
 
     private boolean isSame(ItemStack a, ItemStack b) {
