@@ -90,9 +90,21 @@ public class ServerItemHandler {
     public void stonecutterSwap(ServerPlayer player, StonecutterSwapPayload payload) {
         try {
             Item targetItem = Item.byId(payload.targetItemId());
-            ItemStack selected = InventoryUtil.getSelected(player.getInventory());
 
-            if (selected == null || selected.isEmpty()) {
+            int selectedSlot = InventoryUtil.getSelectedId(player.getInventory());
+            int inputSlot = payload.inputSlot();
+
+            var items = InventoryUtil.getNonEquipmentItems(player.getInventory());
+
+            if (inputSlot < 0 || inputSlot >= items.size()) {
+                System.out.println("SERVER: invalid stonecutter input slot " + inputSlot);
+                return;
+            }
+
+            ItemStack oldSelectedStack = items.get(selectedSlot);
+            ItemStack inputStack = items.get(inputSlot);
+
+            if (inputStack == null || inputStack.isEmpty()) {
                 return;
             }
 
@@ -117,17 +129,17 @@ public class ServerItemHandler {
                 int inputNeeded = 1;
                 int outputPerCraft = 1;
 
-                // Forward: selected input -> target output
-                if (entry.input().test(selected) && recipeResult.getItem() == targetItem) {
+                // Forward: input stack -> target output
+                if (entry.input().test(inputStack) && recipeResult.getItem() == targetItem) {
                     forward = true;
                     outputTemplate = recipeResult.copy();
                     inputNeeded = 1;
                     outputPerCraft = recipeResult.getCount();
                 }
 
-                // Reverse: selected output -> target input
+                // Reverse: input stack is recipe output -> target is recipe input
                 if (!forward
-                        && recipeResult.getItem() == selected.getItem()
+                        && recipeResult.getItem() == inputStack.getItem()
                         && entry.input().test(new ItemStack(targetItem))) {
                     reverse = true;
                     outputTemplate = new ItemStack(targetItem);
@@ -145,7 +157,7 @@ public class ServerItemHandler {
 
                 int maxOutputStackSize = outputTemplate.getMaxStackSize();
                 int crafts = Math.min(
-                        selected.getCount() / inputNeeded,
+                        inputStack.getCount() / inputNeeded,
                         maxOutputStackSize / outputPerCraft
                 );
 
@@ -155,66 +167,162 @@ public class ServerItemHandler {
 
                 int inputConsumed = crafts * inputNeeded;
                 int outputProduced = crafts * outputPerCraft;
-                int inputLeftover = selected.getCount() - inputConsumed;
+                int inputLeftover = inputStack.getCount() - inputConsumed;
 
                 ItemStack outputStack = outputTemplate.copy();
                 outputStack.setCount(outputProduced);
 
                 ItemStack leftoverInput = ItemStack.EMPTY;
                 if (inputLeftover > 0) {
-                    leftoverInput = selected.copy();
+                    leftoverInput = inputStack.copy();
                     leftoverInput.setCount(inputLeftover);
                 }
 
-                int selectedSlot = InventoryUtil.getSelectedId(player.getInventory());
+                ItemStack displacedSelected = ItemStack.EMPTY;
+                if (inputSlot != selectedSlot && oldSelectedStack != null && !oldSelectedStack.isEmpty()) {
+                    displacedSelected = oldSelectedStack.copy();
+                }
 
-                if (inputLeftover > 0 && !hasSpaceFor(player, leftoverInput, selectedSlot)) {
-                    System.out.println("SERVER: stonecutter swap blocked, no room for leftover " + leftoverInput);
+                if (!canFitStonecutterTransaction(player, selectedSlot, inputSlot, outputStack, leftoverInput,
+                        displacedSelected)) {
+                    System.out.println("SERVER: stonecutter swap blocked, no room for leftovers. leftoverInput="
+                            + leftoverInput + ", displacedSelected=" + displacedSelected);
                     return;
                 }
 
+                // Commit transaction:
+                // 1. Output goes into selected slot.
                 player.getInventory().setItem(selectedSlot, outputStack);
 
-                if (inputLeftover > 0) {
+                // 2. If the input came from somewhere else, clear that input slot.
+                //    If inputSlot == selectedSlot, it was already replaced by outputStack.
+                if (inputSlot != selectedSlot) {
+                    player.getInventory().setItem(inputSlot, ItemStack.EMPTY);
+                }
+
+                // 3. Reinsert leftover input, if any.
+                if (!leftoverInput.isEmpty()) {
                     boolean inserted = insertIntoInventoryExceptSelected(player, leftoverInput, selectedSlot);
                     if (!inserted) {
-                        // This should not happen because we checked before mutating.
-                        // Do not drop items. Revert to safe state.
-                        player.getInventory().setItem(selectedSlot, selected);
+                        System.out.println("SERVER: unexpected insert failure for leftover input");
+                        return;
+                    }
+                }
+
+                // 4. Reinsert the old selected stack if the input came from another slot.
+                if (!displacedSelected.isEmpty()) {
+                    boolean inserted = insertIntoInventoryExceptSelected(player, displacedSelected, selectedSlot);
+                    if (!inserted) {
+                        System.out.println("SERVER: unexpected insert failure for displaced selected stack");
                         return;
                     }
                 }
 
                 player.inventoryMenu.broadcastChanges();
 
-                System.out.println("SERVER: stonecutter swap executed: "
-                        + selected + " -> " + outputStack
-                        + ", leftover=" + leftoverInput);
+                System.out.println("SERVER: stonecutter swap executed: inputSlot="
+                        + inputSlot
+                        + ", selectedSlot=" + selectedSlot
+                        + ", input=" + inputStack
+                        + ", output=" + outputStack
+                        + ", leftoverInput=" + leftoverInput
+                        + ", displacedSelected=" + displacedSelected);
 
                 return;
             }
 
-            System.out.println("SERVER: no matching stonecutter recipe for target " + targetItem + " from " + selected);
+            System.out.println("SERVER: no matching stonecutter recipe for target " + targetItem + " from " + inputStack);
         } catch (Throwable th) {
             network_logger.error("Error handling stonecutter swap packet!", th);
         }
     }
 
-    private boolean hasSpaceFor(ServerPlayer player, ItemStack stack, int selectedSlot) {
+    private boolean canFitStonecutterTransaction(ServerPlayer player, int selectedSlot, int inputSlot,
+                                                 ItemStack outputStack, ItemStack leftoverInput, ItemStack displacedSelected) {
+        var realItems = InventoryUtil.getNonEquipmentItems(player.getInventory());
+        java.util.List<ItemStack> simulated = new java.util.ArrayList<>();
+
+        for (ItemStack stack : realItems) {
+            simulated.add(stack.copy());
+        }
+
+        // Selected slot is reserved for the final output.
+        simulated.set(selectedSlot, outputStack.copy());
+
+        // If input came from another slot, clear it in the simulation.
+        // That slot may then receive leftover input or the displaced selected item.
+        if (inputSlot != selectedSlot) {
+            simulated.set(inputSlot, ItemStack.EMPTY);
+        }
+
+        if (!insertIntoSimulatedInventoryExceptSelected(simulated, leftoverInput.copy(), selectedSlot)) {
+            return false;
+        }
+
+        if (!insertIntoSimulatedInventoryExceptSelected(simulated, displacedSelected.copy(), selectedSlot)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private boolean insertIntoSimulatedInventoryExceptSelected(java.util.List<ItemStack> items, ItemStack stack,
+                                                               int selectedSlot) {
         if (stack == null || stack.isEmpty()) {
             return true;
         }
 
-        ItemStack testStack = stack.copy();
-        return insertIntoInventoryExceptSelected(player, testStack, selectedSlot, true);
+        // First merge into existing compatible stacks.
+        for (int i = 0; i < items.size(); i++) {
+            if (i == selectedSlot) {
+                continue;
+            }
+
+            ItemStack existing = items.get(i);
+
+            if (existing.isEmpty()) {
+                continue;
+            }
+
+            if (!ItemStack.isSameItemSameComponents(existing, stack)) {
+                continue;
+            }
+
+            int space = existing.getMaxStackSize() - existing.getCount();
+            if (space <= 0) {
+                continue;
+            }
+
+            int moved = Math.min(space, stack.getCount());
+            existing.grow(moved);
+            stack.shrink(moved);
+
+            if (stack.isEmpty()) {
+                return true;
+            }
+        }
+
+        // Then place into empty non-equipment slots.
+        for (int i = 0; i < items.size(); i++) {
+            if (i == selectedSlot) {
+                continue;
+            }
+
+            ItemStack existing = items.get(i);
+
+            if (!existing.isEmpty()) {
+                continue;
+            }
+
+            items.set(i, stack.copy());
+            stack.setCount(0);
+            return true;
+        }
+
+        return stack.isEmpty();
     }
 
     private boolean insertIntoInventoryExceptSelected(ServerPlayer player, ItemStack stack, int selectedSlot) {
-        return insertIntoInventoryExceptSelected(player, stack, selectedSlot, false);
-    }
-
-    private boolean insertIntoInventoryExceptSelected(ServerPlayer player, ItemStack stack, int selectedSlot,
-                                                      boolean simulate) {
         if (stack == null || stack.isEmpty()) {
             return true;
         }
@@ -243,11 +351,7 @@ public class ServerItemHandler {
             }
 
             int moved = Math.min(space, stack.getCount());
-
-            if (!simulate) {
-                existing.grow(moved);
-            }
-
+            existing.grow(moved);
             stack.shrink(moved);
 
             if (stack.isEmpty()) {
@@ -267,10 +371,7 @@ public class ServerItemHandler {
                 continue;
             }
 
-            if (!simulate) {
-                player.getInventory().setItem(i, stack.copy());
-            }
-
+            player.getInventory().setItem(i, stack.copy());
             stack.setCount(0);
             return true;
         }

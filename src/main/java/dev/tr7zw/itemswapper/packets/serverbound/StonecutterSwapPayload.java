@@ -10,10 +10,11 @@ import net.minecraft.resources.*;
  * Payload for requesting a server-side stonecutter swap.
  *
  * @param targetItemId Raw item registry id for the item the player wants.
+ * @param inputSlot    Non-equipment inventory slot to use as the recipe input.
  */
-public record StonecutterSwapPayload(int targetItemId) implements CustomPacketPayloadSupport {
+public record StonecutterSwapPayload(int targetItemId, int inputSlot) implements CustomPacketPayloadSupport {
 
-    public static final StonecutterSwapPayload INSTANCE = new StonecutterSwapPayload(0);
+    public static final StonecutterSwapPayload INSTANCE = new StonecutterSwapPayload(0, 0);
     public static final Identifier ID = McId.create(ItemSwapperMod.MODID, "stonecutter_swap").id();
 
     @Override
@@ -24,6 +25,7 @@ public record StonecutterSwapPayload(int targetItemId) implements CustomPacketPa
     @Override
     public void write(FriendlyByteBuf buffer) {
         buffer.writeVarInt(targetItemId);
+        buffer.writeVarInt(inputSlot);
     }
 
     @Override
@@ -32,7 +34,7 @@ public record StonecutterSwapPayload(int targetItemId) implements CustomPacketPa
     }
 
     public StonecutterSwapPayload(FriendlyByteBuf buffer) {
-        this(buffer.readVarInt());
+        this(buffer.readVarInt(), buffer.readVarInt());
     }
 
 }

@@ -15,6 +15,7 @@ import net.minecraft.world.item.*;
 
 import java.util.*;
 import java.util.concurrent.atomic.*;
+
 import dev.tr7zw.itemswapper.provider.StonecutterItemProvider;
 
 @RequiredArgsConstructor
@@ -46,10 +47,12 @@ public class ItemManager {
         }
 
         if (slot.inventory() == StonecutterItemProvider.STONECUTTER_INVENTORY_ID) {
-            System.out.println("CLIENT: sending stonecutter swap packet for " + slot.item());
+            System.out.println("CLIENT: sending stonecutter swap packet for " + slot.item()
+                    + " using input slot " + slot.slot());
 
             ClientNetworkUtil.sendPacket(new StonecutterSwapPayload(
-                    Item.getId(slot.item().getItem())
+                    Item.getId(slot.item().getItem()),
+                    slot.slot()
             ));
 
             clientAPI.itemSwapSentEvent.callEvent(new ItemSwapperClientAPI.SwapSent(slot));
