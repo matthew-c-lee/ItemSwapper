@@ -99,10 +99,6 @@ public class ServerItemHandler {
             var recipes = player.level().recipeAccess().stonecutterRecipes();
 
             for (var entry : recipes.entries()) {
-                if (!entry.input().test(selected)) {
-                    continue;
-                }
-
                 var display = entry.recipe().optionDisplay();
 
                 ItemStack recipeResult = display.resolveForFirstStack(
@@ -110,26 +106,58 @@ public class ServerItemHandler {
                                 .create(new net.minecraft.util.context.ContextKeySet.Builder().build())
                 );
 
-                if (recipeResult.isEmpty() || recipeResult.getItem() != targetItem) {
+                if (recipeResult.isEmpty()) {
                     continue;
                 }
 
-                int outputPerCraft = recipeResult.getCount();
-                if (outputPerCraft <= 0) {
+                boolean forward = false;
+                boolean reverse = false;
+
+                ItemStack outputTemplate = ItemStack.EMPTY;
+                int inputNeeded = 1;
+                int outputPerCraft = 1;
+
+                // Forward: selected input -> target output
+                if (entry.input().test(selected) && recipeResult.getItem() == targetItem) {
+                    forward = true;
+                    outputTemplate = recipeResult.copy();
+                    inputNeeded = 1;
+                    outputPerCraft = recipeResult.getCount();
+                }
+
+                // Reverse: selected output -> target input
+                if (!forward
+                        && recipeResult.getItem() == selected.getItem()
+                        && entry.input().test(new ItemStack(targetItem))) {
+                    reverse = true;
+                    outputTemplate = new ItemStack(targetItem);
+                    inputNeeded = recipeResult.getCount(); // e.g. 2 slabs -> 1 stone
+                    outputPerCraft = 1;
+                }
+
+                if (!forward && !reverse) {
                     continue;
                 }
 
-                int maxOutputStackSize = recipeResult.getMaxStackSize();
-                int crafts = Math.min(selected.getCount(), maxOutputStackSize / outputPerCraft);
+                if (inputNeeded <= 0 || outputPerCraft <= 0) {
+                    continue;
+                }
+
+                int maxOutputStackSize = outputTemplate.getMaxStackSize();
+                int crafts = Math.min(
+                        selected.getCount() / inputNeeded,
+                        maxOutputStackSize / outputPerCraft
+                );
 
                 if (crafts <= 0) {
                     return;
                 }
 
+                int inputConsumed = crafts * inputNeeded;
                 int outputProduced = crafts * outputPerCraft;
-                int inputLeftover = selected.getCount() - crafts;
+                int inputLeftover = selected.getCount() - inputConsumed;
 
-                ItemStack outputStack = recipeResult.copy();
+                ItemStack outputStack = outputTemplate.copy();
                 outputStack.setCount(outputProduced);
 
                 ItemStack leftoverInput = ItemStack.EMPTY;
