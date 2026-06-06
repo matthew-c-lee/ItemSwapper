@@ -46,7 +46,7 @@ public abstract class ItemSwapperSharedMod extends ItemSwapperBase {
 
     private void lateInit() {
         clientProviderManager.registerContainerProvider(new ShulkerContainerProvider());
-        clientProviderManager.registerLateItemProvider(new StonecutterItemProvider());
+        clientProviderManager.registerEarlyItemProvider(new StonecutterItemProvider());
         clientProviderManager.registerNameProvider(new PotionNameProvider());
         clientProviderManager.registerNameProvider(new InstrumentItemNameProvider());
         clientProviderManager.registerNameProvider(new RecordNameProvider());
