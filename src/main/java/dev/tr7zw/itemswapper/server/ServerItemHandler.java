@@ -15,6 +15,12 @@ import net.minecraft.world.item.ItemStack;
 import dev.tr7zw.itemswapper.packets.serverbound.StonecutterSwapPayload;
 import net.minecraft.world.item.Item;
 
+import java.util.ArrayList;
+import java.util.List;
+
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.Items;
+
 public class ServerItemHandler {
 
     private static final Logger network_logger = LogManager.getLogger("ItemSwapper-Network");
@@ -108,154 +114,232 @@ public class ServerItemHandler {
                 return;
             }
 
-            var recipes = player.level().recipeAccess().stonecutterRecipes();
+            List<StonecutterStep> path = findStonecutterPath(player, inputStack.getItem(), targetItem);
 
-            for (var entry : recipes.entries()) {
-                var display = entry.recipe().optionDisplay();
-
-                ItemStack recipeResult = display.resolveForFirstStack(
-                        new net.minecraft.util.context.ContextMap.Builder()
-                                .create(new net.minecraft.util.context.ContextKeySet.Builder().build())
-                );
-
-                if (recipeResult.isEmpty()) {
-                    continue;
-                }
-
-                boolean forward = false;
-                boolean reverse = false;
-
-                ItemStack outputTemplate = ItemStack.EMPTY;
-                int inputNeeded = 1;
-                int outputPerCraft = 1;
-
-                // Forward: input stack -> target output
-                if (entry.input().test(inputStack) && recipeResult.getItem() == targetItem) {
-                    forward = true;
-                    outputTemplate = recipeResult.copy();
-                    inputNeeded = 1;
-                    outputPerCraft = recipeResult.getCount();
-                }
-
-                // Reverse: input stack is recipe output -> target is recipe input
-                if (!forward
-                        && recipeResult.getItem() == inputStack.getItem()
-                        && entry.input().test(new ItemStack(targetItem))) {
-                    reverse = true;
-                    outputTemplate = new ItemStack(targetItem);
-                    inputNeeded = recipeResult.getCount(); // e.g. 2 slabs -> 1 stone
-                    outputPerCraft = 1;
-                }
-
-                if (!forward && !reverse) {
-                    continue;
-                }
-
-                if (inputNeeded <= 0 || outputPerCraft <= 0) {
-                    continue;
-                }
-
-                int maxOutputStackSize = outputTemplate.getMaxStackSize();
-                int crafts = Math.min(
-                        inputStack.getCount() / inputNeeded,
-                        maxOutputStackSize / outputPerCraft
-                );
-
-                if (crafts <= 0) {
-                    return;
-                }
-
-                int inputConsumed = crafts * inputNeeded;
-                int outputProduced = crafts * outputPerCraft;
-                int inputLeftover = inputStack.getCount() - inputConsumed;
-
-                ItemStack outputStack = outputTemplate.copy();
-                outputStack.setCount(outputProduced);
-
-                ItemStack leftoverInput = ItemStack.EMPTY;
-                if (inputLeftover > 0) {
-                    leftoverInput = inputStack.copy();
-                    leftoverInput.setCount(inputLeftover);
-                }
-
-                ItemStack displacedSelected = ItemStack.EMPTY;
-                if (inputSlot != selectedSlot && oldSelectedStack != null && !oldSelectedStack.isEmpty()) {
-                    displacedSelected = oldSelectedStack.copy();
-                }
-
-                if (!canFitStonecutterTransaction(player, selectedSlot, inputSlot, outputStack, leftoverInput,
-                        displacedSelected)) {
-                    System.out.println("SERVER: stonecutter swap blocked, no room for leftovers. leftoverInput="
-                            + leftoverInput + ", displacedSelected=" + displacedSelected);
-                    return;
-                }
-
-                // Commit transaction:
-                // 1. Output goes into selected slot.
-                player.getInventory().setItem(selectedSlot, outputStack);
-
-                // 2. If the input came from somewhere else, clear that input slot.
-                //    If inputSlot == selectedSlot, it was already replaced by outputStack.
-                if (inputSlot != selectedSlot) {
-                    player.getInventory().setItem(inputSlot, ItemStack.EMPTY);
-                }
-
-                // 3. Reinsert leftover input, if any.
-                if (!leftoverInput.isEmpty()) {
-                    boolean inserted = insertIntoInventoryExceptSelected(player, leftoverInput, selectedSlot);
-                    if (!inserted) {
-                        System.out.println("SERVER: unexpected insert failure for leftover input");
-                        return;
-                    }
-                }
-
-                // 4. Reinsert the old selected stack if the input came from another slot.
-                if (!displacedSelected.isEmpty()) {
-                    boolean inserted = insertIntoInventoryExceptSelected(player, displacedSelected, selectedSlot);
-                    if (!inserted) {
-                        System.out.println("SERVER: unexpected insert failure for displaced selected stack");
-                        return;
-                    }
-                }
-
-                player.inventoryMenu.broadcastChanges();
-
-                System.out.println("SERVER: stonecutter swap executed: inputSlot="
-                        + inputSlot
-                        + ", selectedSlot=" + selectedSlot
-                        + ", input=" + inputStack
-                        + ", output=" + outputStack
-                        + ", leftoverInput=" + leftoverInput
-                        + ", displacedSelected=" + displacedSelected);
-
+            if (path.isEmpty()) {
+                System.out.println("SERVER: no stonecutter path for target " + targetItem + " from " + inputStack);
                 return;
             }
 
-            System.out.println("SERVER: no matching stonecutter recipe for target " + targetItem + " from " + inputStack);
+            StonecutterPlan plan = calculateStonecutterPlan(inputStack, path);
+
+            if (plan == null || plan.outputStack().isEmpty()) {
+                System.out.println("SERVER: could not calculate stonecutter plan for target " + targetItem
+                        + " from " + inputStack);
+                return;
+            }
+
+            ItemStack displacedSelected = ItemStack.EMPTY;
+            if (inputSlot != selectedSlot && oldSelectedStack != null && !oldSelectedStack.isEmpty()) {
+                displacedSelected = oldSelectedStack.copy();
+            }
+
+            if (!canFitStonecutterTransaction(player, selectedSlot, inputSlot, plan.leftoverInput(),
+                    plan.leftoverIntermediate(), displacedSelected, plan.outputStack())) {
+                System.out.println("SERVER: stonecutter swap blocked, no room for leftovers. leftoverInput="
+                        + plan.leftoverInput()
+                        + ", leftoverIntermediate=" + plan.leftoverIntermediate()
+                        + ", displacedSelected=" + displacedSelected);
+                return;
+            }
+
+            // Snapshot before mutating, so unexpected insert failures cannot delete items.
+            List<ItemStack> before = new ArrayList<>();
+            for (ItemStack stack : items) {
+                before.add(stack.copy());
+            }
+
+            // Commit transaction:
+            // 1. Final output always goes into selected slot.
+            player.getInventory().setItem(selectedSlot, plan.outputStack().copy());
+
+            // 2. If input came from another slot, clear that input slot.
+            //    Leftover original input is reinserted below.
+            if (inputSlot != selectedSlot) {
+                player.getInventory().setItem(inputSlot, ItemStack.EMPTY);
+            }
+
+            // 3. Reinsert leftover original input.
+            if (!plan.leftoverInput().isEmpty()) {
+                boolean inserted = insertIntoInventoryExceptSelected(player, plan.leftoverInput().copy(), selectedSlot);
+                if (!inserted) {
+                    restoreNonEquipmentInventory(player, before);
+                    player.inventoryMenu.broadcastChanges();
+                    System.out.println("SERVER: unexpected insert failure for leftover input");
+                    return;
+                }
+            }
+
+            // 4. Reinsert leftover intermediate item, if a two-hop path created extra intermediate.
+            if (!plan.leftoverIntermediate().isEmpty()) {
+                boolean inserted = insertIntoInventoryExceptSelected(player, plan.leftoverIntermediate().copy(), selectedSlot);
+                if (!inserted) {
+                    restoreNonEquipmentInventory(player, before);
+                    player.inventoryMenu.broadcastChanges();
+                    System.out.println("SERVER: unexpected insert failure for leftover intermediate");
+                    return;
+                }
+            }
+
+            // 5. Reinsert the old selected stack if the input came from another slot.
+            if (!displacedSelected.isEmpty()) {
+                boolean inserted = insertIntoInventoryExceptSelected(player, displacedSelected.copy(), selectedSlot);
+                if (!inserted) {
+                    restoreNonEquipmentInventory(player, before);
+                    player.inventoryMenu.broadcastChanges();
+                    System.out.println("SERVER: unexpected insert failure for displaced selected stack");
+                    return;
+                }
+            }
+
+            player.inventoryMenu.broadcastChanges();
+
+            System.out.println("SERVER: stonecutter swap executed: inputSlot="
+                    + inputSlot
+                    + ", selectedSlot=" + selectedSlot
+                    + ", input=" + inputStack
+                    + ", path=" + path
+                    + ", output=" + plan.outputStack()
+                    + ", leftoverInput=" + plan.leftoverInput()
+                    + ", leftoverIntermediate=" + plan.leftoverIntermediate()
+                    + ", displacedSelected=" + displacedSelected);
         } catch (Throwable th) {
             network_logger.error("Error handling stonecutter swap packet!", th);
         }
     }
 
+    private List<StonecutterStep> findStonecutterPath(ServerPlayer player, Item inputItem, Item targetItem) {
+        List<StonecutterStep> directSteps = findSteps(player, inputItem, targetItem);
+
+        if (!directSteps.isEmpty()) {
+            return List.of(directSteps.get(0));
+        }
+
+        List<StonecutterStep> firstSteps = findStepsFrom(player, inputItem);
+
+        for (StonecutterStep first : firstSteps) {
+            List<StonecutterStep> secondSteps = findSteps(player, first.outputItem(), targetItem);
+
+            if (!secondSteps.isEmpty()) {
+                return List.of(first, secondSteps.get(0));
+            }
+        }
+
+        return List.of();
+    }
+
+    private List<StonecutterStep> findStepsFrom(ServerPlayer player, Item inputItem) {
+        List<StonecutterStep> steps = new ArrayList<>();
+
+        var recipes = player.level().recipeAccess().stonecutterRecipes();
+
+        for (var entry : recipes.entries()) {
+            ItemStack recipeResult = resolveRecipeResult(entry);
+
+            if (recipeResult.isEmpty()) {
+                continue;
+            }
+
+            // Forward: concrete input item -> recipe result.
+            if (entry.input().test(new ItemStack(inputItem))) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        recipeResult.getItem(),
+                        1,
+                        recipeResult.getCount()
+                ));
+            }
+
+            // Reverse: recipe result -> every concrete item accepted by recipe input.
+            if (recipeResult.getItem() == inputItem) {
+                for (Item candidateInput : BuiltInRegistries.ITEM) {
+                    if (candidateInput == Items.AIR) {
+                        continue;
+                    }
+
+                    if (!entry.input().test(new ItemStack(candidateInput))) {
+                        continue;
+                    }
+
+                    steps.add(new StonecutterStep(
+                            inputItem,
+                            candidateInput,
+                            recipeResult.getCount(),
+                            1
+                    ));
+                }
+            }
+        }
+
+        return steps;
+    }
+
+    private List<StonecutterStep> findSteps(ServerPlayer player, Item inputItem, Item targetItem) {
+        List<StonecutterStep> steps = new ArrayList<>();
+
+        var recipes = player.level().recipeAccess().stonecutterRecipes();
+
+        for (var entry : recipes.entries()) {
+            ItemStack recipeResult = resolveRecipeResult(entry);
+
+            if (recipeResult.isEmpty()) {
+                continue;
+            }
+
+            // Forward: concrete input item -> recipe result.
+            if (entry.input().test(new ItemStack(inputItem)) && recipeResult.getItem() == targetItem) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        targetItem,
+                        1,
+                        recipeResult.getCount()
+                ));
+            }
+
+            // Reverse: recipe result -> concrete target item.
+            if (recipeResult.getItem() == inputItem && entry.input().test(new ItemStack(targetItem))) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        targetItem,
+                        recipeResult.getCount(),
+                        1
+                ));
+            }
+        }
+
+        return steps;
+    }
+
+    private ItemStack resolveRecipeResult(Object entry) {
+        var recipeEntry = (net.minecraft.world.item.crafting.SelectableRecipe.SingleInputEntry<?>) entry;
+        var display = recipeEntry.recipe().optionDisplay();
+
+        return display.resolveForFirstStack(
+                new net.minecraft.util.context.ContextMap.Builder()
+                        .create(new net.minecraft.util.context.ContextKeySet.Builder().build())
+        );
+    }
+
     private boolean canFitStonecutterTransaction(ServerPlayer player, int selectedSlot, int inputSlot,
-                                                 ItemStack outputStack, ItemStack leftoverInput, ItemStack displacedSelected) {
+                                                 ItemStack leftoverInput, ItemStack leftoverIntermediate, ItemStack displacedSelected, ItemStack outputStack) {
         var realItems = InventoryUtil.getNonEquipmentItems(player.getInventory());
-        java.util.List<ItemStack> simulated = new java.util.ArrayList<>();
+        List<ItemStack> simulated = new ArrayList<>();
 
         for (ItemStack stack : realItems) {
             simulated.add(stack.copy());
         }
 
-        // Selected slot is reserved for the final output.
         simulated.set(selectedSlot, outputStack.copy());
 
-        // If input came from another slot, clear it in the simulation.
-        // That slot may then receive leftover input or the displaced selected item.
         if (inputSlot != selectedSlot) {
             simulated.set(inputSlot, ItemStack.EMPTY);
         }
 
         if (!insertIntoSimulatedInventoryExceptSelected(simulated, leftoverInput.copy(), selectedSlot)) {
+            return false;
+        }
+
+        if (!insertIntoSimulatedInventoryExceptSelected(simulated, leftoverIntermediate.copy(), selectedSlot)) {
             return false;
         }
 
@@ -266,13 +350,11 @@ public class ServerItemHandler {
         return true;
     }
 
-    private boolean insertIntoSimulatedInventoryExceptSelected(java.util.List<ItemStack> items, ItemStack stack,
-                                                               int selectedSlot) {
+    private boolean insertIntoSimulatedInventoryExceptSelected(List<ItemStack> items, ItemStack stack, int selectedSlot) {
         if (stack == null || stack.isEmpty()) {
             return true;
         }
 
-        // First merge into existing compatible stacks.
         for (int i = 0; i < items.size(); i++) {
             if (i == selectedSlot) {
                 continue;
@@ -302,7 +384,6 @@ public class ServerItemHandler {
             }
         }
 
-        // Then place into empty non-equipment slots.
         for (int i = 0; i < items.size(); i++) {
             if (i == selectedSlot) {
                 continue;
@@ -329,7 +410,6 @@ public class ServerItemHandler {
 
         var items = InventoryUtil.getNonEquipmentItems(player.getInventory());
 
-        // First merge into existing compatible stacks.
         for (int i = 0; i < items.size(); i++) {
             if (i == selectedSlot) {
                 continue;
@@ -359,7 +439,6 @@ public class ServerItemHandler {
             }
         }
 
-        // Then place into empty non-equipment slots only.
         for (int i = 0; i < items.size(); i++) {
             if (i == selectedSlot) {
                 continue;
@@ -379,6 +458,103 @@ public class ServerItemHandler {
         return stack.isEmpty();
     }
 
+    private StonecutterPlan calculateStonecutterPlan(ItemStack inputStack, List<StonecutterStep> path) {
+        if (path.isEmpty()) {
+            return null;
+        }
+
+        if (path.size() == 1) {
+            StonecutterStep step = path.get(0);
+
+            int crafts = Math.min(
+                    inputStack.getCount() / step.inputCount(),
+                    step.outputItem().getDefaultInstance().getMaxStackSize() / step.outputCount()
+            );
+
+            if (crafts <= 0) {
+                return null;
+            }
+
+            int inputConsumed = crafts * step.inputCount();
+            int outputProduced = crafts * step.outputCount();
+            int inputLeftover = inputStack.getCount() - inputConsumed;
+
+            ItemStack outputStack = new ItemStack(step.outputItem(), outputProduced);
+
+            ItemStack leftoverInput = ItemStack.EMPTY;
+            if (inputLeftover > 0) {
+                leftoverInput = inputStack.copy();
+                leftoverInput.setCount(inputLeftover);
+            }
+
+            return new StonecutterPlan(outputStack, leftoverInput, ItemStack.EMPTY);
+        }
+
+        if (path.size() == 2) {
+            StonecutterStep first = path.get(0);
+            StonecutterStep second = path.get(1);
+
+            int maxFirstCrafts = inputStack.getCount() / first.inputCount();
+
+            if (maxFirstCrafts <= 0) {
+                return null;
+            }
+
+            int maxIntermediateProduced = maxFirstCrafts * first.outputCount();
+
+            int maxSecondCraftsByIntermediate = maxIntermediateProduced / second.inputCount();
+            int maxSecondCraftsByOutputStack = second.outputItem().getDefaultInstance().getMaxStackSize()
+                    / second.outputCount();
+
+            int secondCrafts = Math.min(maxSecondCraftsByIntermediate, maxSecondCraftsByOutputStack);
+
+            if (secondCrafts <= 0) {
+                return null;
+            }
+
+            // Use the minimum number of first-step crafts required to supply the second step.
+            int intermediateNeeded = secondCrafts * second.inputCount();
+            int firstCrafts = divideRoundUp(intermediateNeeded, first.outputCount());
+
+            int inputConsumed = firstCrafts * first.inputCount();
+            int intermediateProduced = firstCrafts * first.outputCount();
+            int intermediateLeftover = intermediateProduced - intermediateNeeded;
+            int outputProduced = secondCrafts * second.outputCount();
+            int inputLeftover = inputStack.getCount() - inputConsumed;
+
+            if (inputConsumed <= 0 || inputConsumed > inputStack.getCount()) {
+                return null;
+            }
+
+            ItemStack outputStack = new ItemStack(second.outputItem(), outputProduced);
+
+            ItemStack leftoverInput = ItemStack.EMPTY;
+            if (inputLeftover > 0) {
+                leftoverInput = inputStack.copy();
+                leftoverInput.setCount(inputLeftover);
+            }
+
+            ItemStack leftoverIntermediate = ItemStack.EMPTY;
+            if (intermediateLeftover > 0) {
+                leftoverIntermediate = new ItemStack(first.outputItem(), intermediateLeftover);
+            }
+
+            return new StonecutterPlan(outputStack, leftoverInput, leftoverIntermediate);
+        }
+
+        return null;
+    }
+
+    private void restoreNonEquipmentInventory(ServerPlayer player, List<ItemStack> snapshot) {
+        for (int i = 0; i < snapshot.size(); i++) {
+            player.getInventory().setItem(i, snapshot.get(i).copy());
+        }
+    }
+
+    private int divideRoundUp(int value, int divisor) {
+        return (value + divisor - 1) / divisor;
+    }
+
     private boolean isSame(ItemStack a, ItemStack b) {
         //? if < 1.17.0 {
 
@@ -390,6 +566,12 @@ public class ServerItemHandler {
 
         return ItemStack.isSameItemSameComponents(a, b);
         //? }
+    }
+
+    private record StonecutterStep(Item inputItem, Item outputItem, int inputCount, int outputCount) {
+    }
+
+    private record StonecutterPlan(ItemStack outputStack, ItemStack leftoverInput, ItemStack leftoverIntermediate) {
     }
 
 }

@@ -12,6 +12,11 @@ import net.minecraft.util.context.ContextMap;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 
+import java.util.ArrayList;
+
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.Items;
+
 public class StonecutterItemProvider implements ItemProvider {
 
     public static final int STONECUTTER_INVENTORY_ID = -1000;
@@ -55,67 +60,156 @@ public class StonecutterItemProvider implements ItemProvider {
             return null;
         }
 
+        List<StonecutterStep> directSteps = findSteps(inputStack.getItem(), targetItem);
+
+        for (StonecutterStep step : directSteps) {
+            ItemStack result = calculatePathResult(inputStack, List.of(step));
+            if (!result.isEmpty()) {
+                return new AvailableSlot(STONECUTTER_INVENTORY_ID, inputSlot, result);
+            }
+        }
+
+        List<StonecutterStep> firstSteps = findStepsFrom(inputStack.getItem());
+
+        for (StonecutterStep first : firstSteps) {
+            List<StonecutterStep> secondSteps = findSteps(first.outputItem(), targetItem);
+
+            for (StonecutterStep second : secondSteps) {
+                ItemStack result = calculatePathResult(inputStack, List.of(first, second));
+                if (!result.isEmpty()) {
+                    return new AvailableSlot(STONECUTTER_INVENTORY_ID, inputSlot, result);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private List<StonecutterStep> findStepsFrom(Item inputItem) {
+        List<StonecutterStep> steps = new ArrayList<>();
+
         var recipes = minecraft.level.recipeAccess().stonecutterRecipes();
 
         for (var entry : recipes.entries()) {
-            var display = entry.recipe().optionDisplay();
-
-            ItemStack recipeResult = display.resolveForFirstStack(
-                    new ContextMap.Builder().create(new ContextKeySet.Builder().build())
-            );
+            ItemStack recipeResult = resolveRecipeResult(entry);
 
             if (recipeResult.isEmpty()) {
                 continue;
             }
 
-            // Forward: input stack -> target output
-            if (entry.input().test(inputStack) && recipeResult.getItem() == targetItem) {
-                int outputPerCraft = recipeResult.getCount();
-                if (outputPerCraft <= 0) {
-                    continue;
-                }
-
-                int maxStackSize = recipeResult.getMaxStackSize();
-
-                int crafts = Math.min(
-                        inputStack.getCount(),
-                        maxStackSize / outputPerCraft
-                );
-
-                if (crafts <= 0) {
-                    return null;
-                }
-
-                ItemStack result = recipeResult.copy();
-                result.setCount(crafts * outputPerCraft);
-                return new AvailableSlot(STONECUTTER_INVENTORY_ID, inputSlot, result);
+            // Forward: concrete input item -> recipe result.
+            if (entry.input().test(new ItemStack(inputItem))) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        recipeResult.getItem(),
+                        1,
+                        recipeResult.getCount()
+                ));
             }
 
-            // Reverse: input stack is recipe output -> target is recipe input
-            if (recipeResult.getItem() == inputStack.getItem()
-                    && entry.input().test(new ItemStack(targetItem))) {
-                int inputNeeded = recipeResult.getCount(); // e.g. 2 slabs -> 1 stone
-                int outputPerCraft = 1;
+            // Reverse: recipe result -> every concrete item accepted by recipe input.
+            //
+            // Example:
+            // recipe: stone -> 2 stone_slab
+            // inputItem: stone_slab
+            //
+            // This adds:
+            // stone_slab -> stone
+            if (recipeResult.getItem() == inputItem) {
+                for (Item candidateInput : BuiltInRegistries.ITEM) {
+                    if (candidateInput == Items.AIR) {
+                        continue;
+                    }
 
-                if (inputNeeded <= 0) {
-                    continue;
+                    if (!entry.input().test(new ItemStack(candidateInput))) {
+                        continue;
+                    }
+
+                    steps.add(new StonecutterStep(
+                            inputItem,
+                            candidateInput,
+                            recipeResult.getCount(),
+                            1
+                    ));
                 }
-
-                int crafts = Math.min(
-                        inputStack.getCount() / inputNeeded,
-                        targetItem.getDefaultInstance().getMaxStackSize() / outputPerCraft
-                );
-
-                if (crafts <= 0) {
-                    return null;
-                }
-
-                ItemStack result = new ItemStack(targetItem, crafts * outputPerCraft);
-                return new AvailableSlot(STONECUTTER_INVENTORY_ID, inputSlot, result);
             }
         }
 
-        return null;
+        return steps;
+    }
+
+    private List<StonecutterStep> findSteps(Item inputItem, Item targetItem) {
+        List<StonecutterStep> steps = new ArrayList<>();
+
+        var recipes = minecraft.level.recipeAccess().stonecutterRecipes();
+
+        for (var entry : recipes.entries()) {
+            ItemStack recipeResult = resolveRecipeResult(entry);
+
+            if (recipeResult.isEmpty()) {
+                continue;
+            }
+
+            // Forward: concrete input item -> recipe result.
+            if (entry.input().test(new ItemStack(inputItem)) && recipeResult.getItem() == targetItem) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        targetItem,
+                        1,
+                        recipeResult.getCount()
+                ));
+            }
+
+            // Reverse: recipe result -> concrete target item.
+            if (recipeResult.getItem() == inputItem && entry.input().test(new ItemStack(targetItem))) {
+                steps.add(new StonecutterStep(
+                        inputItem,
+                        targetItem,
+                        recipeResult.getCount(),
+                        1
+                ));
+            }
+        }
+
+        return steps;
+    }
+
+    private ItemStack calculatePathResult(ItemStack inputStack, List<StonecutterStep> path) {
+        int count = inputStack.getCount();
+        Item currentItem = inputStack.getItem();
+
+        for (StonecutterStep step : path) {
+            if (step.inputItem() != currentItem) {
+                return ItemStack.EMPTY;
+            }
+
+            int crafts = count / step.inputCount();
+            if (crafts <= 0) {
+                return ItemStack.EMPTY;
+            }
+
+            count = crafts * step.outputCount();
+            currentItem = step.outputItem();
+
+            int maxStackSize = currentItem.getDefaultInstance().getMaxStackSize();
+            if (count > maxStackSize) {
+                count = maxStackSize;
+            }
+        }
+
+        return new ItemStack(currentItem, count);
+    }
+
+    private ItemStack resolveRecipeResult(Object entry) {
+        var recipeEntry = (net.minecraft.world.item.crafting.SelectableRecipe.SingleInputEntry<?>) entry;
+        var display = recipeEntry.recipe().optionDisplay();
+
+        return display.resolveForFirstStack(
+                new ContextMap.Builder().create(new ContextKeySet.Builder().build())
+        );
+    }
+
+    private record StonecutterStep(Item inputItem, Item outputItem, int inputCount, int outputCount) {
     }
 
 }
