@@ -17,6 +17,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import dev.tr7zw.itemswapper.provider.StonecutterItemProvider;
 
 public class ClientProviderManager {
 
@@ -114,6 +115,13 @@ public class ClientProviderManager {
 
     private void addUnstackableItems(List<AvailableSlot> ids, AvailableSlot slot) {
         for (AvailableSlot s : ids) {
+            boolean existingIsStonecutter = s.inventory() == StonecutterItemProvider.STONECUTTER_INVENTORY_ID;
+            boolean newIsStonecutter = slot.inventory() == StonecutterItemProvider.STONECUTTER_INVENTORY_ID;
+
+            if (existingIsStonecutter || newIsStonecutter) {
+                continue;
+            }
+
             if (ItemUtil.isSame(s.item(), slot.item())) {
                 s.amount().accumulateAndGet(slot.item().getCount(), (i1, i2) -> i1 + i2);
                 return;
